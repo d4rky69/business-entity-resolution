@@ -1,22 +1,102 @@
 """Candidate Generation (Blocking) Module.
 
-Scalable multi-pass candidate generation to reduce comparison space from O(N_S1 * (N_S2 + N_S3))
-to manageable, high-recall candidate pairs for the downstream matching classifier.
-
-Blocking Strategies:
-1. Standard Key Blocking: Exact postal code / PIN match + first letter of business name
-2. Token Inverted Index Blocking: Shared rare name/address n-grams or tokens
-3. Phonetic Blocking: Soundex / Metaphone on primary name token within same country
-4. Embedding / ANN Blocking: Approximate nearest neighbors via vector index (FAISS)
-
-Writes internal working format:
-    data/interim/candidates_long.tsv
-    Columns: source1_entity_id, candidate_entity_id, block_reason
+Simplest working version:
+- Match if normalized business names share the same first 3 letters AND same country.
+- Writes candidate pairs to data/interim/candidates_long.tsv.
+- Format: source1_entity_id, candidate_entity_id, block_reason (tab-separated)
 """
 
 import os
-from typing import Any, Dict, Iterable, List, Optional, Set, Tuple
-import pandas as pd
+from typing import Dict, Iterable, List, Optional
+from .normalize import normalize_name
+
+
+def generate_candidates_from_files(
+    s1_path: str,
+    s2_path: str,
+    s3_path: str,
+    output_path: str = "data/interim/candidates_long.tsv",
+    max_candidates_per_s1: int = 3,
+) -> str:
+    """Streamlined streaming blocking from raw source TSV files.
+
+    Indexes target sources (S2 and S3) by (country, first 3 letters of normalized name),
+    then queries each Source 1 record to generate candidate match pairs.
+
+    Args:
+        s1_path: Path to test_source1.tsv
+        s2_path: Path to test_source2.tsv
+        s3_path: Path to test_source3.tsv
+        output_path: Output TSV file path (data/interim/candidates_long.tsv)
+        max_candidates_per_s1: Maximum candidate pairs per Source 1 entity (default 3)
+
+    Returns:
+        output_path string
+    """
+    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+
+    print(f"Building prefix index from {s2_path} and {s3_path}...")
+    # Index: (country, prefix_3) -> list of target entity IDs
+    target_index: Dict[tuple, List[str]] = {}
+
+    target_count = 0
+    for target_path in (s2_path, s3_path):
+        if not os.path.isfile(target_path):
+            print(f"Warning: Target file not found: {target_path}")
+            continue
+
+        with open(target_path, "r", encoding="utf-8") as f:
+            header = f.readline()
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 4:
+                    target_id = parts[0].strip()
+                    raw_name = parts[1]
+                    country = parts[3].strip().upper()
+                    norm_nm = normalize_name(raw_name)
+                    prefix = norm_nm[:3]
+                    if prefix:
+                        key = (country, prefix)
+                        if key not in target_index:
+                            target_index[key] = []
+                        # Retain a bounded pool per prefix bucket to prevent explosive memory
+                        if len(target_index[key]) < 10:
+                            target_index[key].append(target_id)
+                target_count += 1
+                if target_count % 2000000 == 0:
+                    print(f"  Indexed {target_count:,} target records...")
+
+    print(f"Index built with {len(target_index):,} distinct (country, prefix3) buckets.")
+    print(f"Generating candidate pairs for Source 1 entities from {s1_path}...")
+
+    total_pairs = 0
+    s1_count = 0
+
+    with open(s1_path, "r", encoding="utf-8") as f_in, open(output_path, "w", encoding="utf-8") as f_out:
+        f_out.write("source1_entity_id\tcandidate_entity_id\tblock_reason\n")
+        f_in.readline()  # skip header
+
+        for line in f_in:
+            parts = line.rstrip("\n").split("\t")
+            if len(parts) >= 4:
+                s1_id = parts[0].strip()
+                raw_name = parts[1]
+                country = parts[3].strip().upper()
+                norm_nm = normalize_name(raw_name)
+                prefix = norm_nm[:3]
+                if prefix:
+                    key = (country, prefix)
+                    candidates = target_index.get(key, [])
+                    # Pick up to max_candidates_per_s1
+                    for cand_id in candidates[:max_candidates_per_s1]:
+                        f_out.write(f"{s1_id}\t{cand_id}\tfirst_3_letters_and_country\n")
+                        total_pairs += 1
+            s1_count += 1
+            if s1_count % 500000 == 0:
+                print(f"  Processed {s1_count:,} S1 entities -> {total_pairs:,} candidate pairs...")
+
+    print(f"Finished blocking: {total_pairs:,} candidate pairs written to {output_path}")
+    return output_path
 
 
 def generate_candidates(
@@ -24,82 +104,34 @@ def generate_candidates(
     s2_records: Iterable[dict],
     s3_records: Iterable[dict],
     output_path: str = "data/interim/candidates_long.tsv",
-    max_candidates_per_s1: int = 50,
+    max_candidates_per_s1: int = 3,
 ) -> str:
-    """Stub: Multi-pass candidate generation across Source 1 and Target Sources (S2, S3).
-
-    Generates candidate match pairs using indexing and multi-pass blocking keys.
-    Deduplicates (S1, target) pairs while concatenating the triggering block reasons.
-
-    Args:
-        s1_records: Iterable of normalized Source 1 records (deduplicated anchor entities)
-        s2_records: Iterable of normalized Source 2 records
-        s3_records: Iterable of normalized Source 3 records
-        output_path: Destination TSV path for internal candidate pair records
-        max_candidates_per_s1: Guardrail cap on maximum candidates retained per anchor
-
-    Returns:
-        output_path where candidate pairs were written
-    """
+    """In-memory candidate generation fallback for list/dict records."""
     os.makedirs(os.path.dirname(output_path), exist_ok=True)
 
-    # In-memory candidate storage: (s1_id, cand_id) -> list of block_reasons
-    candidates: Dict[Tuple[str, str], List[str]] = {}
+    target_index: Dict[tuple, List[str]] = {}
+    for r in list(s2_records) + list(s3_records):
+        t_id = r.get("entity_id", "")
+        country = (r.get("country") or "").strip().upper()
+        norm_nm = r.get("clean_name") or normalize_name(r.get("business_name") or "")
+        prefix = norm_nm[:3]
+        if prefix:
+            key = (country, prefix)
+            target_index.setdefault(key, []).append(t_id)
 
-    # Combine S2 and S3 target pools
-    target_pool: List[dict] = list(s2_records) + list(s3_records)
+    total_pairs = 0
+    with open(output_path, "w", encoding="utf-8") as f_out:
+        f_out.write("source1_entity_id\tcandidate_entity_id\tblock_reason\n")
+        for s1 in s1_records:
+            s1_id = s1.get("entity_id", "")
+            country = (s1.get("country") or "").strip().upper()
+            norm_nm = s1.get("clean_name") or normalize_name(s1.get("business_name") or "")
+            prefix = norm_nm[:3]
+            if prefix:
+                candidates = target_index.get((country, prefix), [])
+                for cand_id in candidates[:max_candidates_per_s1]:
+                    f_out.write(f"{s1_id}\t{cand_id}\tfirst_3_letters_and_country\n")
+                    total_pairs += 1
 
-    # Build lightweight inverted indexes over target pool
-    # Index 1: (country, postal_code) -> [target_id]
-    geo_index: Dict[Tuple[str, str], List[str]] = {}
-    # Index 2: (country, first_token) -> [target_id]
-    name_token_index: Dict[Tuple[str, str], List[str]] = {}
-
-    for target in target_pool:
-        t_id = target.get("entity_id", "")
-        country = target.get("country", "")
-        postal = target.get("postal_code")
-        base_name = target.get("base_name") or target.get("clean_name", "")
-        tokens = [t for t in base_name.split() if len(t) > 2]
-
-        if postal:
-            geo_index.setdefault((country, postal), []).append(t_id)
-
-        if tokens:
-            name_token_index.setdefault((country, tokens[0]), []).append(t_id)
-
-    # Pass 1 & 2: Query candidate matches for each S1 entity
-    for s1 in s1_records:
-        s1_id = s1.get("entity_id", "")
-        country = s1.get("country", "")
-        postal = s1.get("postal_code")
-        base_name = s1.get("base_name") or s1.get("clean_name", "")
-        tokens = [t for t in base_name.split() if len(t) > 2]
-
-        # Postal match
-        if postal and (country, postal) in geo_index:
-            for t_id in geo_index[(country, postal)]:
-                candidates.setdefault((s1_id, t_id), []).append("postal_match")
-
-        # Name token match
-        if tokens and (country, tokens[0]) in name_token_index:
-            for t_id in name_token_index[(country, tokens[0])]:
-                candidates.setdefault((s1_id, t_id), []).append("name_token_match")
-
-    # Format into tabular rows
-    rows = []
-    for (s1_id, cand_id), reasons in candidates.items():
-        rows.append({
-            "source1_entity_id": s1_id,
-            "candidate_entity_id": cand_id,
-            "block_reason": "|".join(sorted(set(reasons))),
-        })
-
-    candidates_df = pd.DataFrame(rows)
-    if candidates_df.empty:
-        candidates_df = pd.DataFrame(columns=["source1_entity_id", "candidate_entity_id", "block_reason"])
-
-    # Explicitly write tab-separated TSV with no index
-    candidates_df.to_csv(output_path, sep="\t", index=False, encoding="utf-8")
-    print(f"Generated {len(candidates_df)} candidate pairs saved to {output_path}")
+    print(f"Generated {total_pairs} candidate pairs to {output_path}")
     return output_path

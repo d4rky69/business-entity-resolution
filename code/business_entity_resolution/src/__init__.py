@@ -11,10 +11,23 @@ Modular pipeline for record linkage across multi-source noisy business records:
 
 from .normalize import normalize_record, get_source
 from .blocking import generate_candidates
-from .features import compute_features
-from .train import train_classifier
-from .verifier import verify_pair
 from .infer import aggregate_to_submission_format, main
+
+# Optional modules requiring third-party libraries (pandas, lightgbm, etc.)
+try:
+    from .features import compute_features
+except ImportError:
+    compute_features = None
+
+try:
+    from .train import train_classifier
+except ImportError:
+    train_classifier = None
+
+try:
+    from .verifier import verify_pair
+except ImportError:
+    verify_pair = None
 
 __all__ = [
     "normalize_record",

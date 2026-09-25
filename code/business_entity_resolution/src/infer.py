@@ -1,171 +1,156 @@
 """End-to-End Inference and Submission Aggregation Module.
 
-Chains all pipeline stages:
-1. Load raw test datasets (test_source1.tsv, test_source2.tsv, test_source3.tsv)
-2. Normalize records using country-specific and generic legal suffixes
-3. Generate candidate pairs via multi-pass blocking
-4. Compute dense pairwise similarity features
-5. Run trained matching model / verifier scoring
-6. Aggregate results into official submission TSVs:
-   - output/matching_results.tsv  (source1_entity_id, matched_entity_ids)
-   - output/candidate_pairs.tsv   (source1_entity_id, candidate_entity_ids)
+Simplest working pipeline:
+1. Generate candidates using blocking.py (same first 3 letters of normalized name + same country)
+2. Read all candidate pairs from data/interim/candidates_long.tsv
+3. Treat every candidate as an accepted match (baseline run, no classifier)
+4. Stream-aggregate into the official submission TSVs:
+   - output/matching_results.tsv (columns: source1_entity_id, matched_entity_ids)
+   - output/candidate_pairs.tsv  (columns: source1_entity_id, candidate_entity_ids)
 """
 
 import argparse
-import json
 import os
-from typing import Dict, Iterable, List, Optional, Set
-import pandas as pd
+import sys
+import time
+from typing import Dict, Iterable, List, Set
 
-from .normalize import get_source, normalize_record
-from .blocking import generate_candidates
-from .features import compute_features
-from .verifier import verify_pair
-
-
-def load_raw_tsv(file_path: str) -> List[dict]:
-    """Reads raw source TSV file with explicit tab delimiter into a list of record dicts.
-
-    Columns expected: entity_id, business_name, business_address, country
-    Note: Raw files do not contain a source column.
-    """
-    if not os.path.isfile(file_path):
-        print(f"Warning: File not found: {file_path}")
-        return []
-    df = pd.read_csv(file_path, sep="\t", dtype=str, keep_default_na=False)
-    return df.to_dict(orient="records")
+from .blocking import generate_candidates_from_files
 
 
 def aggregate_to_submission_format(
-    long_df: pd.DataFrame,
-    id_col_name: str,
-    all_s1_ids: Iterable[str],
-    output_path: str,
+    candidates_long_path: str,
+    s1_source_path: str,
+    matching_output_path: str = "output/matching_results.tsv",
+    candidate_output_path: str = "output/candidate_pairs.tsv",
 ) -> None:
-    """Writes the official one-row-per-source1_entity TSV file.
+    """Stream-aggregates candidates into official one-row-per-source1_entity TSVs.
 
-    Guarantees full compliance with competition validator rules:
-    - Exactly one row for every Source 1 entity in all_s1_ids
-    - Header is exactly: source1_entity_id\t{id_col_name}
-    - Tab-separated (.tsv) explicitly (sep='\\t')
-    - Comma-separated target IDs with no internal duplicate IDs
-    - No self-matches (no S1 IDs in target list)
-    - Empty string for entities with zero matches/candidates
+    Guarantees strict compliance with validator rules:
+    - Every S1 entity in test_source1.tsv appears on exactly one row.
+    - Headers are exactly:
+        matching_results.tsv -> source1_entity_id\\tmatched_entity_ids
+        candidate_pairs.tsv  -> source1_entity_id\\tcandidate_entity_ids
+    - Separated by TAB ('\\t').
+    - Empty string for S1 entities with no matches/candidates.
+    - Comma-separated list with no internal duplicates and no S1 self-matches.
 
     Args:
-        long_df: DataFrame containing at least ['source1_entity_id', 'target_entity_id']
-        id_col_name: Column name for list ('matched_entity_ids' or 'candidate_entity_ids')
-        all_s1_ids: Full universe of Source 1 entity IDs that must be included
-        output_path: Destination file path (e.g. output/matching_results.tsv)
+        candidates_long_path: Path to data/interim/candidates_long.tsv
+        s1_source_path: Path to test_source1.tsv (to ensure all S1 entities appear)
+        matching_output_path: Destination for matching_results.tsv
+        candidate_output_path: Destination for candidate_pairs.tsv
     """
-    os.makedirs(os.path.dirname(output_path), exist_ok=True)
+    os.makedirs(os.path.dirname(matching_output_path), exist_ok=True)
+    os.makedirs(os.path.dirname(candidate_output_path), exist_ok=True)
 
-    # Aggregate target IDs grouped by source1_entity_id
-    grouped_map: Dict[str, List[str]] = {}
-    if not long_df.empty and "source1_entity_id" in long_df.columns:
-        # Determine candidate/target ID column
-        target_col = "candidate_entity_id" if "candidate_entity_id" in long_df.columns else "target_entity_id"
-        if target_col in long_df.columns:
-            for s1_id, group in long_df.groupby("source1_entity_id"):
-                s1_id_str = str(s1_id).strip()
-                seen_ids: Set[str] = set()
-                clean_target_ids: List[str] = []
-                for tid in group[target_col].dropna():
-                    tid_str = str(tid).strip()
+    print(f"Reading candidates from {candidates_long_path}...")
+    # Map: source1_entity_id -> list of unique candidate_ids
+    s1_candidates: Dict[str, List[str]] = {}
+
+    if os.path.isfile(candidates_long_path):
+        with open(candidates_long_path, "r", encoding="utf-8") as f:
+            header = f.readline()
+            for line in f:
+                parts = line.rstrip("\n").split("\t")
+                if len(parts) >= 2:
+                    s1 = parts[0].strip()
+                    cand = parts[1].strip()
                     # Filter out self matches and duplicates
-                    if tid_str and not tid_str.startswith("S1-") and tid_str not in seen_ids:
-                        seen_ids.add(tid_str)
-                        clean_target_ids.append(tid_str)
-                grouped_map[s1_id_str] = clean_target_ids
+                    if cand and not cand.startswith("S1-"):
+                        if s1 not in s1_candidates:
+                            s1_candidates[s1] = [cand]
+                        elif cand not in s1_candidates[s1]:
+                            s1_candidates[s1].append(cand)
 
-    # Build full output for EVERY required Source 1 entity in stable order
-    rows = []
-    for s1_id in sorted(all_s1_ids):
-        s1_clean = str(s1_id).strip()
-        matched = grouped_map.get(s1_clean, [])
-        rows.append({
-            "source1_entity_id": s1_clean,
-            id_col_name: ",".join(matched),
-        })
+    print(f"Aggregated candidates for {len(s1_candidates):,} distinct Source 1 entities.")
+    print(f"Streaming final TSVs for all Source 1 entities from {s1_source_path}...")
 
-    out_df = pd.DataFrame(rows)
-    # Write tab-separated TSV with no row index
-    out_df.to_csv(output_path, sep="\t", index=False, encoding="utf-8")
-    print(f"Saved {len(out_df)} rows to {output_path} ({id_col_name})")
+    total_rows = 0
+    non_empty_rows = 0
+
+    with open(s1_source_path, "r", encoding="utf-8") as f_s1, \
+         open(matching_output_path, "w", encoding="utf-8") as f_match, \
+         open(candidate_output_path, "w", encoding="utf-8") as f_cand:
+
+        # Write exact required headers
+        f_match.write("source1_entity_id\tmatched_entity_ids\n")
+        f_cand.write("source1_entity_id\tcandidate_entity_ids\n")
+
+        f_s1.readline()  # skip header in test_source1.tsv
+
+        for line in f_s1:
+            parts = line.split("\t", 1)
+            s1_id = parts[0].strip()
+            if not s1_id:
+                continue
+
+            cands = s1_candidates.get(s1_id, [])
+            cand_str = ",".join(cands)
+
+            # Write one row per S1 entity
+            f_match.write(f"{s1_id}\t{cand_str}\n")
+            f_cand.write(f"{s1_id}\t{cand_str}\n")
+
+            total_rows += 1
+            if cand_str:
+                non_empty_rows += 1
+
+    print(f"Generated {total_rows:,} rows ({non_empty_rows:,} non-empty, {total_rows - non_empty_rows:,} empty)")
+    print(f"  -> Matching results saved: {matching_output_path}")
+    print(f"  -> Candidate pairs saved:  {candidate_output_path}")
 
 
 def main():
-    parser = argparse.ArgumentParser(description="Run end-to-end business entity resolution inference.")
-    parser.add_argument("--test-dir", default="data/raw/dataset/test", help="Directory with test_source1/2/3.tsv")
-    parser.add_argument("--config", default="config/suffixes.json", help="Path to suffixes.json")
-    parser.add_argument("--interim-dir", default="data/interim", help="Path to store interim working files")
-    parser.add_argument("--output-dir", default="output", help="Directory to store submission TSV files")
-    parser.add_argument("--model-path", default="models/matching_model.pkl", help="Trained model pickle")
+    parser = argparse.ArgumentParser(description="Run baseline end-to-end entity resolution pipeline.")
+    parser.add_argument("--test-dir", default="data/raw/dataset/test", help="Path to test datasets directory")
+    parser.add_argument("--interim-dir", default="data/interim", help="Path to interim directory")
+    parser.add_argument("--output-dir", default="output", help="Path to final submission directory")
+    parser.add_argument("--max-candidates-per-s1", type=int, default=3, help="Max candidates per S1 entity")
     args = parser.parse_args()
 
-    print(f"=== Starting Entity Resolution Pipeline ===")
-    print(f"Test Directory: {args.test_dir}")
-    print(f"Output Directory: {args.output_dir}")
+    t_start = time.time()
+    print("=" * 60)
+    print("Starting Baseline Business Entity Resolution Pipeline")
+    print(f"Test Directory:     {args.test_dir}")
+    print(f"Interim Directory:  {args.interim_dir}")
+    print(f"Output Directory:   {args.output_dir}")
+    print("=" * 60)
 
-    # Step 1: Load Legal Suffixes Configuration
-    suffix_dict = {}
-    if os.path.isfile(args.config):
-        with open(args.config, "r", encoding="utf-8") as f:
-            suffix_dict = json.load(f)
+    s1_path = os.path.join(args.test_dir, "test_source1.tsv")
+    s2_path = os.path.join(args.test_dir, "test_source2.tsv")
+    s3_path = os.path.join(args.test_dir, "test_source3.tsv")
+    cand_path = os.path.join(args.interim_dir, "candidates_long.tsv")
 
-    # Step 2: Load Raw Datasets
-    s1_raw = load_raw_tsv(os.path.join(args.test_dir, "test_source1.tsv"))
-    s2_raw = load_raw_tsv(os.path.join(args.test_dir, "test_source2.tsv"))
-    s3_raw = load_raw_tsv(os.path.join(args.test_dir, "test_source3.tsv"))
+    # Step 1: Candidate Generation (Blocking on first 3 letters of normalized name + country)
+    print("\n[Step 1/2] Candidate Generation (Blocking)...")
+    generate_candidates_from_files(
+        s1_path=s1_path,
+        s2_path=s2_path,
+        s3_path=s3_path,
+        output_path=cand_path,
+        max_candidates_per_s1=args.max_candidates_per_s1,
+    )
 
-    all_s1_ids = {r["entity_id"] for r in s1_raw if "entity_id" in r}
-    print(f"Loaded {len(s1_raw)} S1, {len(s2_raw)} S2, {len(s3_raw)} S3 records.")
-
-    # Step 3: Normalization
-    print("Normalizing records...")
-    norm_s1 = [normalize_record(r, suffix_dict) for r in s1_raw]
-    norm_s2 = [normalize_record(r, suffix_dict) for r in s2_raw]
-    norm_s3 = [normalize_record(r, suffix_dict) for r in s3_raw]
-
-    norm_lookup = {r["entity_id"]: r for r in norm_s1 + norm_s2 + norm_s3}
-
-    # Step 4: Candidate Generation (Blocking)
-    print("Generating candidate pairs (blocking)...")
-    cand_long_path = os.path.join(args.interim_dir, "candidates_long.tsv")
-    generate_candidates(norm_s1, norm_s2, norm_s3, output_path=cand_long_path)
-
-    # Step 5: Feature Extraction
-    print("Computing pairwise features...")
-    feat_path = os.path.join(args.interim_dir, "features.tsv")
-    compute_features(candidates_long_path=cand_long_path, normalized_records=norm_lookup, output_path=feat_path)
-
-    # Step 6: Scoring & High-Precision Verification
-    # candidate_pairs.tsv must reflect the LAST-stage candidate set scored by the classifier
-    cand_df = pd.read_csv(cand_long_path, sep="\t", dtype=str) if os.path.isfile(cand_long_path) else pd.DataFrame()
-
-    matched_pairs = []
-    if not cand_df.empty:
-        for _, row in cand_df.iterrows():
-            s1_id = row["source1_entity_id"]
-            cand_id = row["candidate_entity_id"]
-            v_res = verify_pair(norm_lookup.get(s1_id, {}), norm_lookup.get(cand_id, {}))
-            if v_res.get("same_entity", False) and v_res.get("confidence", 0.0) >= 0.7:
-                matched_pairs.append({
-                    "source1_entity_id": s1_id,
-                    "target_entity_id": cand_id,
-                })
-
-    matched_df = pd.DataFrame(matched_pairs)
-
-    # Step 7: Write OFFICIAL submission outputs
+    # Step 2: Aggregation to official submission TSV formats
+    print("\n[Step 2/2] Aggregation to Official Submission Format...")
     matching_out = os.path.join(args.output_dir, "matching_results.tsv")
     candidate_out = os.path.join(args.output_dir, "candidate_pairs.tsv")
 
-    print("Formatting submission outputs...")
-    aggregate_to_submission_format(matched_df, "matched_entity_ids", all_s1_ids, matching_out)
-    aggregate_to_submission_format(cand_df, "candidate_entity_ids", all_s1_ids, candidate_out)
+    aggregate_to_submission_format(
+        candidates_long_path=cand_path,
+        s1_source_path=s1_path,
+        matching_output_path=matching_out,
+        candidate_output_path=candidate_out,
+    )
 
-    print("=== Pipeline Complete ===")
+    elapsed = time.time() - t_start
+    print("\n" + "=" * 60)
+    print(f"Pipeline Completed Successfully in {elapsed:.2f}s!")
+    print(f"Official Submission Files:")
+    print(f"  1. {matching_out} (Leaderboard matching results)")
+    print(f"  2. {candidate_out} (Blocking candidate pairs)")
+    print("=" * 60)
 
 
 if __name__ == "__main__":
