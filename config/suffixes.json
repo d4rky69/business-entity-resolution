@@ -1,0 +1,57 @@
+{
+  "generic": [
+    "inc",
+    "incorporated",
+    "corp",
+    "corporation",
+    "ltd",
+    "limited",
+    "co",
+    "company",
+    "group",
+    "holdings",
+    "enterprises",
+    "services",
+    "technologies",
+    "solutions",
+    "international",
+    "global"
+  ],
+  "US": [
+    "llc",
+    "inc",
+    "corp",
+    "corporation",
+    "pllc",
+    "lp",
+    "llp",
+    "ltd",
+    "co",
+    "company",
+    "pa",
+    "pc"
+  ],
+  "IN": [
+    "pvt ltd",
+    "private limited",
+    "ltd",
+    "limited",
+    "llp",
+    "opc",
+    "enterprises",
+    "technologies",
+    "solutions"
+  ],
+  "FR": [
+    "sas",
+    "sasu",
+    "sarl",
+    "sa",
+    "snc",
+    "eurl",
+    "gie",
+    "sci",
+    "selarl",
+    "ei"
+  ]
+}

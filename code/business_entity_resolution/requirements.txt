@@ -1,0 +1,21 @@
+# Core Data & Numerical Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Supervised Classifier & Gradient Boosting
+lightgbm>=4.0.0
+scikit-learn>=1.3.0
+
+# String Similarity & Phonetic Algorithms
+rapidfuzz>=3.0.0
+jellyfish>=1.0.0
+
+# Semantic Embeddings & Approximate Nearest Neighbors (ANN) Blocking
+sentence-transformers>=2.2.0
+faiss-cpu>=1.7.4
+
+# Address Parsing & Standardization
+# Note: python-libpostal requires external C-libraries (libpostal).
+# postal-address / usaddress provides a portable pure-Python fallback.
+postal-address>=0.1.0
+usaddress>=0.5.10

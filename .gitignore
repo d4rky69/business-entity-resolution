@@ -1,0 +1,41 @@
+# Environments & Secrets
+.env
+.venv/
+env/
+venv/
+ENV/
+
+# Python Bytecode & Cache
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.pytest_cache/
+.coverage
+
+# Large Datasets & Working Files (Do NOT commit raw data or interim files)
+data/raw/
+data/interim/*
+!data/interim/.gitkeep
+*.tsv
+*.csv
+*.zip
+
+# Final TSV outputs should not be committed (only .gitkeep is tracked)
+output/*.tsv
+output/*.csv
+
+# Model Artifacts & Checkpoints
+models/
+*.pkl
+*.joblib
+*.bin
+*.onnx
+*.pt
+
+# OS & Editor
+.DS_Store
+._*
+Thumbs.db
+.vscode/
+.idea/
